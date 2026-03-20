@@ -45,18 +45,16 @@ func AnthropicToResponses(req *AnthropicRequest) (*ResponsesRequest, error) {
 		out.Tools = convertAnthropicToolsToResponses(req.Tools)
 	}
 
-	// Convert thinking → reasoning.
-	// generate_summary="auto" causes the upstream to emit reasoning_summary_text
-	// streaming events; the include array only needs reasoning.encrypted_content
-	// (already set above) for content continuity.
-	if req.Thinking != nil {
-		switch req.Thinking.Type {
-		case "enabled":
-			out.Reasoning = &ResponsesReasoning{Effort: "high", Summary: "auto"}
-		case "adaptive":
-			out.Reasoning = &ResponsesReasoning{Effort: "medium", Summary: "auto"}
-		}
-		// "disabled" or unknown → omit reasoning
+	// Determine reasoning effort: only output_config.effort controls the
+	// level; thinking.type is ignored. Default is xhigh when unset.
+	// Anthropic levels map to OpenAI: low→low, medium→high, high→xhigh.
+	effort := "high" // default → maps to xhigh
+	if req.OutputConfig != nil && req.OutputConfig.Effort != "" {
+		effort = req.OutputConfig.Effort
+	}
+	out.Reasoning = &ResponsesReasoning{
+		Effort:  mapAnthropicEffortToResponses(effort),
+		Summary: "auto",
 	}
 
 	// Convert tool_choice
@@ -279,7 +277,6 @@ func anthropicAssistantToResponses(raw json.RawMessage) ([]ResponsesInputItem, e
 			CallID:    fcID,
 			Name:      b.Name,
 			Arguments: args,
-			ID:        fcID,
 		})
 	}
 
@@ -380,6 +377,23 @@ func extractAnthropicTextFromBlocks(blocks []AnthropicContentBlock) string {
 	return strings.Join(parts, "\n\n")
 }
 
+// mapAnthropicEffortToResponses converts Anthropic reasoning effort levels to
+// OpenAI Responses API effort levels.
+//
+//	low    → low
+//	medium → high
+//	high   → xhigh
+func mapAnthropicEffortToResponses(effort string) string {
+	switch effort {
+	case "medium":
+		return "high"
+	case "high":
+		return "xhigh"
+	default:
+		return effort // "low" and any unknown values pass through unchanged
+	}
+}
+
 // convertAnthropicToolsToResponses maps Anthropic tool definitions to
 // Responses API tools. Server-side tools like web_search are mapped to their
 // OpenAI equivalents; regular tools become function tools.
@@ -395,8 +409,41 @@ func convertAnthropicToolsToResponses(tools []AnthropicTool) []ResponsesTool {
 			Type:        "function",
 			Name:        t.Name,
 			Description: t.Description,
-			Parameters:  t.InputSchema,
+			Parameters:  normalizeToolParameters(t.InputSchema),
 		})
+	}
+	return out
+}
+
+// normalizeToolParameters ensures the tool parameter schema is valid for
+// OpenAI's Responses API, which requires "properties" on object schemas.
+//
+//   - nil/empty → {"type":"object","properties":{}}
+//   - type=object without properties → adds "properties": {}
+//   - otherwise → returned unchanged
+func normalizeToolParameters(schema json.RawMessage) json.RawMessage {
+	if len(schema) == 0 || string(schema) == "null" {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
+	}
+
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(schema, &m); err != nil {
+		return schema
+	}
+
+	typ := m["type"]
+	if string(typ) != `"object"` {
+		return schema
+	}
+
+	if _, ok := m["properties"]; ok {
+		return schema
+	}
+
+	m["properties"] = json.RawMessage(`{}`)
+	out, err := json.Marshal(m)
+	if err != nil {
+		return schema
 	}
 	return out
 }
